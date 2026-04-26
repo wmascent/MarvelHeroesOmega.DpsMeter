@@ -116,11 +116,25 @@ public sealed class DpsOverlayPresenter : IDisposable
             // visibility watcher would lag, defeating the auto-hide UX.
             //
             // The event subscriptions on _sniffer (DamageDealt, EntityCreated, etc.) hang off the
-            // MhMissionSniffer instance directly, so the restart is transparent to the meter:
-            // only the in-flight TCP reassembly buffers are discarded (acceptable — they were
-            // already starved of new packets, that's why the user is restarting).  After
-            // TryStart() returns, the next packet that arrives flows back into the same meter
-            // state with all 60s windows / encounter accumulator / owner pin intact.
+            // MhMissionSniffer instance directly, so the restart is transparent to the meter
+            // ITSELF; only the in-flight TCP reassembly buffers are discarded (acceptable — they
+            // were already starved of new packets, that's why the user is restarting).
+            //
+            // BUT — per user request, the recovery is also expected to give a "fresh start":
+            // empty leaderboard, zero totals, no carried-over fight.  Without this, the user
+            // clicks Restart sniffer, packets resume, and the leaderboard still shows the
+            // previous fight's stale numbers (since totals + encounter accumulator survive a
+            // pure capture-handle restart).  We call DpsMeter.ResetForUserRestart() between
+            // Stop() and TryStart() so the wipe happens BEFORE any new packets can flow:
+            //
+            //   1. Stop()                        — capture threads die, no more events
+            //   2. ResetForUserRestart()         — meter state wiped (no race with packets)
+            //   3. TryStart()                    — packets resume into a clean meter
+            //
+            // Identity caches (_heroNameByOwnerId, dbId bindings, nickname map, per-hero
+            // personal-best max hit) are deliberately preserved by the meter's reset — peers
+            // don't lose their identification just because we recycled our pcap handle, and
+            // the persisted PB shouldn't reset every time the user pokes the recovery button.
             _window.RestartSnifferRequested += () =>
             {
                 _ = System.Threading.Tasks.Task.Run(() =>
@@ -129,6 +143,23 @@ public sealed class DpsOverlayPresenter : IDisposable
                     {
                         ForceAppendLog("DpsOverlayPresenter: user-requested sniffer restart — stopping...");
                         _sniffer.Stop();
+
+                        // Wipe damage / encounter / owner-pin state in between Stop and Start
+                        // so the meter is guaranteed quiescent during the wipe (no event-thread
+                        // races with the lock(_sync) inside ResetPerRegionState).  _meter can
+                        // technically still be null if the user clicks before the field is
+                        // assigned below — defensive guard so a click during the bootstrap
+                        // window doesn't NRE.
+                        if (_meter != null)
+                        {
+                            _meter.ResetForUserRestart();
+                            ForceAppendLog("DpsOverlayPresenter: meter state wiped (totals, encounter, owner pin, dedup logs) — ready for fresh damage capture.");
+                        }
+                        else
+                        {
+                            ForceAppendLog("DpsOverlayPresenter: meter not yet bound — skipped state wipe; sniffer restart only.");
+                        }
+
                         bool ok = _sniffer.TryStart();
                         if (ok)
                             ForceAppendLog($"DpsOverlayPresenter: sniffer restarted successfully (open device count={_sniffer.OpenedDeviceCount}).");

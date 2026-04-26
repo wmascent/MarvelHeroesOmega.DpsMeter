@@ -2886,15 +2886,51 @@ public sealed class DpsMeter : IDisposable
 
     private void OnRegionChanged(object? sender, RegionChangedEvent e)
     {
-        // Log the region-change first so that post-incident log reads can distinguish
-        // "user actually zoned" from "user was in-place the whole session" — the
-        // cleared state below would otherwise look identical to a fresh session in
-        // post-hoc diagnostics.  Particularly important for triage of the
-        // "nicknames don't resolve" case, since the server ONLY re-sends
-        // NetMessageEntityCreate for remote avatars when the local player zones, so
-        // the absence of this log line is a strong signal that the nickname cache
-        // could not have been refreshed no matter what we did on the client side.
-        Diagnostic?.Invoke($"DpsMeter: region changed — clearing per-region state");
+        // Region changes and user-requested sniffer restarts both want the same per-region
+        // wipe semantics — same fields cleared, same identity caches preserved.  The only
+        // difference is the diagnostic log lines, so we hand the reason in and let the
+        // shared helper format both the "starting" and "completed" log lines.
+        ResetPerRegionState(
+            startReason: "region changed",
+            endContext: $"regionProtoId={e.RegionPrototypeId}");
+    }
+
+    /// <summary>Wipes all per-region damage / encounter / owner-pin state, matching the
+    /// semantics of a region change.  Public entry point used by the presenter when the
+    /// user clicks "Restart sniffer (fix stuck DPS)" — the user expects a fresh start
+    /// (empty leaderboard, zero totals, no carried-over fight) once the pcap handle is
+    /// recycled, otherwise the recovery would feel like a no-op even after the heartbeat
+    /// resumes.  Identity caches (<c>_heroNameByOwnerId</c>, dbId bindings, nickname map,
+    /// per-hero personal-best max hit) are deliberately KEPT — peers don't lose their
+    /// identification just because we recycled our capture handle, and the persisted
+    /// per-hero PB shouldn't reset every time the user pokes the recovery button.
+    /// <para>Safe to call from any thread.  Acquires <c>_sync</c> internally; do NOT
+    /// call from inside an existing <c>_sync</c>-held block (would deadlock).</para>
+    /// </summary>
+    public void ResetForUserRestart() =>
+        ResetPerRegionState(
+            startReason: "user-requested sniffer restart",
+            endContext: null);
+
+    /// <summary>Shared body of <see cref="OnRegionChanged"/> and <see cref="ResetForUserRestart"/>.
+    /// Clears every per-region scoring map, dedup set, and encounter accumulator inside
+    /// <c>_sync</c>, then drops the entity-id prototype cache (its own concurrent collection
+    /// outside the lock) and raises <see cref="DpsChanged"/> so the overlay repaints
+    /// immediately to "—" / empty leaderboard.  Wraps the work in matching diagnostic log
+    /// lines so a post-incident log read can tell a region-change wipe from a user-driven
+    /// restart wipe.</summary>
+    private void ResetPerRegionState(string startReason, string? endContext)
+    {
+        // Log the start of the wipe first so that post-incident log reads can distinguish
+        // a real reset event from "user was in-place the whole session" — the cleared
+        // state below would otherwise look identical to a fresh session in post-hoc
+        // diagnostics.  Particularly important for triage of the "nicknames don't resolve"
+        // case (server ONLY re-sends NetMessageEntityCreate for remote avatars when the
+        // local player zones, so the absence of this log line is a strong signal that the
+        // nickname cache could not have been refreshed no matter what we did on the client
+        // side) and for separating user-initiated wipes from automatic ones during
+        // capture-stall triage.
+        Diagnostic?.Invoke($"DpsMeter: {startReason} — clearing per-region state");
         lock (_sync)
         {
             _scoring.Clear();
@@ -3000,10 +3036,15 @@ public sealed class DpsMeter : IDisposable
         }
         // Drop the entity-id cache too: every id in it is stale after a region transition. The
         // avatar's fresh EntityCreate arrives within a second of the region change message, so
-        // we'll be re-populated before the next DamageDealt.
+        // we'll be re-populated before the next DamageDealt.  In the user-requested-restart
+        // path we still want this cleared even though entity ids are technically still valid
+        // server-side — the restart is the user's "fresh start" cue, and a stale prototype
+        // cache would defeat the purpose of zeroing the leaderboard if a peer's next hit got
+        // attributed via a cached protoIdx without re-emitting the first-hit diagnostic.
         _prototypeByEntityId.Clear();
         DpsChanged?.Invoke(this, EventArgs.Empty);
-        Diagnostic?.Invoke($"DpsMeter: region changed (regionProtoId={e.RegionPrototypeId}) — meter reset");
+        string trailing = endContext == null ? "" : $" ({endContext})";
+        Diagnostic?.Invoke($"DpsMeter: {startReason}{trailing} — meter reset");
     }
 
     private void OnEntityKilled(object? sender, EntityKillEvent e)
