@@ -55,4 +55,78 @@ internal static class User32
     /// our own overlay (right-click menu open), or something else entirely.</summary>
     [DllImport("user32.dll", SetLastError = true)]
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    // ── Low-level mouse hook (for context-menu outside-click dismissal) ───────────────────────
+    // WS_EX_NOACTIVATE breaks WPF's standard ContextMenu / Popup outside-click dismissal because
+    // the Popup relies on Win32 SetCapture, which only holds while a window in our process has
+    // foreground.  An overlay that can't activate can't keep capture, so when the user clicks
+    // anywhere outside the popup (especially on the game's window in another process) the popup
+    // never receives the dismissal signal and stays open forever.
+    //
+    // Solution: install a global low-level mouse hook (WH_MOUSE_LL) only while the menu is
+    // open.  The hook fires for every mouse-down system-wide, regardless of which window
+    // owns the click.  We just check if the click HWND is the popup HWND; if not, close the
+    // menu.  Hook is uninstalled the moment the menu closes — overhead is bounded to the
+    // brief lifetime of a user-initiated context menu.
+    public const int WH_MOUSE_LL = 14;
+    public const int WM_LBUTTONDOWN = 0x0201;
+    public const int WM_RBUTTONDOWN = 0x0204;
+    public const int WM_MBUTTONDOWN = 0x0207;
+    public const int WM_NCLBUTTONDOWN = 0x00A1;
+    public const int WM_NCRBUTTONDOWN = 0x00A4;
+
+    /// <summary>Hook proc signature for WH_MOUSE_LL.  Must call <see cref="CallNextHookEx"/>
+    /// to allow the click to reach the actual target window — DO NOT suppress mouse events
+    /// from the hook (would break literally every click in the system while the menu is open).</summary>
+    public delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT
+    {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MSLLHOOKSTRUCT
+    {
+        public POINT pt;
+        public uint mouseData;
+        public uint flags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern IntPtr SetWindowsHookExW(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+    /// <summary>Returns the topmost HWND at <paramref name="point"/> (screen coordinates).
+    /// Used by the menu-dismissal hook to decide whether a click landed inside the popup or
+    /// somewhere else (game window, other overlay, desktop).</summary>
+    [DllImport("user32.dll")]
+    public static extern IntPtr WindowFromPoint(POINT point);
+
+    /// <summary>Returns the root ancestor of <paramref name="hwnd"/>.  Combined with
+    /// <see cref="WindowFromPoint"/> this lets us walk a child HWND back up to its top-level
+    /// window for popup-membership testing — relevant for tooltip / sub-popup HWNDs that
+    /// belong to the menu but aren't the popup HWND itself.</summary>
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+
+    /// <summary>GA_ROOT — top-level ancestor (skipping owner relationships).</summary>
+    public const uint GA_ROOT = 2;
+
+    /// <summary>Module handle for the calling process — required by <see cref="SetWindowsHookExW"/>
+    /// when installing a global hook.  For WH_MOUSE_LL specifically the hook isn't actually injected
+    /// into other processes, but the API still requires a valid hModule (any module in our process
+    /// works — we use the main exe via <c>GetModuleHandleW(null)</c>).</summary>
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern IntPtr GetModuleHandleW(string? lpModuleName);
 }

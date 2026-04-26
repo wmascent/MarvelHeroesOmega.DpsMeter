@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using System.Windows;
 using MarvelHeroesComporator.NetworkSniffer;
 using System.Windows.Controls;
@@ -53,21 +54,35 @@ public partial class DpsOverlayWindow : Window
         Closing += OnClosingSavePosition;
 
         // ── Context-menu dismissal repair ─────────────────────────────────────────────────────
-        // The overlay window sets WS_EX_NOACTIVATE and returns MA_NOACTIVATE from its
-        // WM_MOUSEACTIVATE hook so dragging the HUD never steals focus from the game.  Side
-        // effect: WPF's ContextMenu is hosted in a Popup that relies on standard window-
-        // activation / focus-loss tracking to detect outside-click dismissal — with the owner
-        // permanently non-activatable, the popup never receives the "you lost focus, close
-        // yourself" signal, so users reported "I can't close the right-click menu".
+        // The overlay sets WS_EX_NOACTIVATE and returns MA_NOACTIVATE from its WM_MOUSEACTIVATE
+        // hook so dragging the HUD never steals focus from the game.  Side effect: WPF's
+        // ContextMenu/Popup outside-click dismissal flow is structurally broken — Popup uses
+        // Win32 SetCapture to detect outside clicks, but SetCapture only holds while a window
+        // in our process has foreground.  An overlay that CANNOT activate cannot retain
+        // capture once the user clicks anywhere outside the popup (especially clicks on the
+        // game window in another process), so the popup just sits there forever.
         //
-        // Fix: subscribe to ContextMenu.Opened/Closed and toggle the WS_EX_NOACTIVATE flag
-        // (and the WM_MOUSEACTIVATE intercept — see WndProc below) only while the menu is
-        // open.  When the menu closes (outside click, item click, Escape), the flag is
-        // restored so normal click-without-activation behavior resumes.  This is a transient
-        // state for as long as the user is actively interacting with the menu, so the brief
-        // activation window doesn't cause any focus-stealing complaints.
+        // The first attempt — temporarily clearing WS_EX_NOACTIVATE while the menu was open —
+        // didn't work because the popup HWND's behavior is set at creation time based on the
+        // owner's flags AND the WPF Popup's capture is requested only once when IsOpen flips
+        // true; clicks on a different process never reach our message loop regardless of the
+        // owner's activation state.
+        //
+        // Real fix: install a low-level system-wide mouse hook (WH_MOUSE_LL) only while the
+        // menu is open.  The hook fires for every mouse-down anywhere in the system (game
+        // window, our overlay, taskbar, desktop, anything), so we get the dismissal signal
+        // even when the click goes to another process.  We then check if the click landed
+        // inside the popup HWND; if not, marshal a "close the menu" call back to the UI
+        // thread.  Hook is uninstalled the moment the menu closes so its overhead is bounded
+        // to the brief lifetime of an open context menu (typically < 1 s of mouse traffic).
         OverlayMenu.Opened += OnOverlayMenuOpened;
         OverlayMenu.Closed += OnOverlayMenuClosed;
+
+        // Cache the delegate so the GC can never collect it while the hook is registered —
+        // SetWindowsHookExW takes a function pointer derived from this delegate, and if the
+        // managed instance is collected the next callback would tear down the process with
+        // ExecutionEngineException.  Field-level rooting is the standard defense.
+        _mouseHookProc = OnLowLevelMouseEvent;
     }
 
     /// <summary>Thread-safe entry point to update the number.  Safe to call from the DpsMeter's
@@ -413,15 +428,9 @@ public partial class DpsOverlayWindow : Window
     {
         // WM_MOUSEACTIVATE with MA_NOACTIVATE = "process the click, but don't bring me to the
         // foreground" — letting the user drag us without yanking focus off the game HUD.
-        //
-        // EXCEPT when the right-click menu is open: the WPF Popup hosting the ContextMenu
-        // detects outside-click dismissal via standard focus-loss tracking, which is broken
-        // by MA_NOACTIVATE.  While the menu is open, we let activation flow normally so the
-        // popup can close itself when the user clicks elsewhere.  The Opened/Closed handlers
-        // (OnOverlayMenuOpened / OnOverlayMenuClosed) toggle the matching WS_EX_NOACTIVATE
-        // bit in lockstep — both knobs need to be released for the popup's dismissal flow
-        // to work, then both restored when the menu closes.
-        if (msg == User32.WM_MOUSEACTIVATE && !OverlayMenu.IsOpen)
+        // Always-on; menu dismissal is handled by the WH_MOUSE_LL hook (see OnLowLevelMouseEvent
+        // below), not by toggling activation state.
+        if (msg == User32.WM_MOUSEACTIVATE)
         {
             handled = true;
             return User32.MA_NOACTIVATE;
@@ -429,30 +438,99 @@ public partial class DpsOverlayWindow : Window
         return IntPtr.Zero;
     }
 
+    // ── Context-menu dismissal via low-level mouse hook ──────────────────────────────────────
+    // _mouseHookProc is initialised in the constructor (delegate kept alive as a GC root for
+    // the lifetime of the window — see comment there for the ExecutionEngineException risk if
+    // we let the GC collect the delegate while the native hook still references it).
+    // _mouseHookHandle is the OS-returned hook handle, non-zero only while the menu is open.
+    // _popupHwnd caches the popup's HWND on first menu-open so the hook callback doesn't have
+    // to walk the visual tree on every mouse event.
+    private readonly User32.LowLevelMouseProc _mouseHookProc;
+    private IntPtr _mouseHookHandle = IntPtr.Zero;
+    private IntPtr _popupHwnd = IntPtr.Zero;
+
     /// <summary>Fires when the user right-clicks and the context menu becomes visible.
-    /// Temporarily clears <see cref="User32.WS_EX_NOACTIVATE"/> so the WPF Popup hosting the
-    /// menu can detect outside-click / focus-loss dismissal via the standard Win32 flow.
-    /// Paired with the matching MA_NOACTIVATE bypass in <see cref="WndProc"/>.</summary>
+    /// Installs a system-wide low-level mouse hook (uninstalled in <see cref="OnOverlayMenuClosed"/>)
+    /// so we can detect mouse-down events on ANY window — including the game window in another
+    /// process — and dismiss the menu when the click lands outside the popup.  This is the
+    /// only reliable dismissal path for HUD overlays whose owner has <see cref="User32.WS_EX_NOACTIVATE"/>
+    /// set; WPF's standard Popup outside-click flow is structurally broken in that scenario.</summary>
     private void OnOverlayMenuOpened(object? sender, RoutedEventArgs e)
     {
-        var hwnd = new WindowInteropHelper(this).Handle;
-        if (hwnd == IntPtr.Zero) return;
-        var ex = User32.GetWindowLongPtr(hwnd, User32.GWL_EXSTYLE);
-        if ((ex & User32.WS_EX_NOACTIVATE) != 0)
-            User32.SetWindowLongPtr(hwnd, User32.GWL_EXSTYLE, ex & ~User32.WS_EX_NOACTIVATE);
+        // Cache the popup's HWND for fast comparisons in the hook callback.  ContextMenu is
+        // hosted in a Popup whose HwndSource is reachable via PresentationSource on the
+        // ContextMenu itself (its visual root lives in the popup's HWND).  HWND is created
+        // lazily on first IsOpen=true and reused on subsequent openings, so this lookup is
+        // valid the first time Opened fires AND on every open afterwards.
+        if (PresentationSource.FromVisual(OverlayMenu) is HwndSource source)
+            _popupHwnd = source.Handle;
+
+        if (_mouseHookHandle != IntPtr.Zero) return; // already installed (defensive)
+
+        // GetModuleHandleW(null) returns the main exe's HMODULE — the API requires a valid
+        // module pointer even though WH_MOUSE_LL doesn't actually inject into other processes.
+        var hMod = User32.GetModuleHandleW(null);
+        _mouseHookHandle = User32.SetWindowsHookExW(User32.WH_MOUSE_LL, _mouseHookProc, hMod, 0);
     }
 
-    /// <summary>Fires when the menu closes (outside click, item click, or Escape).  Restores
-    /// <see cref="User32.WS_EX_NOACTIVATE"/> so subsequent overlay drags don't steal focus
-    /// from Marvel Heroes' fullscreen window.  Restoring is idempotent — if the OS happened
-    /// to clear the bit during the menu's lifetime (which it shouldn't), we just put it back.</summary>
+    /// <summary>Fires when the menu closes (outside click via the hook, item click, Escape).
+    /// Uninstalls the low-level mouse hook so it doesn't keep ticking during normal gameplay
+    /// when the menu isn't visible.</summary>
     private void OnOverlayMenuClosed(object? sender, RoutedEventArgs e)
     {
-        var hwnd = new WindowInteropHelper(this).Handle;
-        if (hwnd == IntPtr.Zero) return;
-        var ex = User32.GetWindowLongPtr(hwnd, User32.GWL_EXSTYLE);
-        if ((ex & User32.WS_EX_NOACTIVATE) == 0)
-            User32.SetWindowLongPtr(hwnd, User32.GWL_EXSTYLE, ex | User32.WS_EX_NOACTIVATE);
+        if (_mouseHookHandle != IntPtr.Zero)
+        {
+            User32.UnhookWindowsHookEx(_mouseHookHandle);
+            _mouseHookHandle = IntPtr.Zero;
+        }
+    }
+
+    /// <summary>Low-level mouse hook callback.  Fires on the UI thread (WH_MOUSE_LL is
+    /// thread-attached even though it sees system-wide events) for every mouse button event
+    /// while the menu is open.  We MUST keep this short — long-running work in a hook proc
+    /// blocks the entire system's mouse input.  Always call <see cref="User32.CallNextHookEx"/>
+    /// at the end so the click reaches the real target window (the game, the desktop, etc.).</summary>
+    private IntPtr OnLowLevelMouseEvent(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && _popupHwnd != IntPtr.Zero)
+        {
+            int msg = wParam.ToInt32();
+            if (msg == User32.WM_LBUTTONDOWN || msg == User32.WM_RBUTTONDOWN ||
+                msg == User32.WM_MBUTTONDOWN || msg == User32.WM_NCLBUTTONDOWN ||
+                msg == User32.WM_NCRBUTTONDOWN)
+            {
+                // Read the screen-coordinate point from the hook payload and ask Windows
+                // which top-level HWND owns the pixel under the cursor.  If it isn't the
+                // popup HWND (or a descendant rooted at the popup), the user clicked outside
+                // the menu and we should dismiss.
+                try
+                {
+                    var data = Marshal.PtrToStructure<User32.MSLLHOOKSTRUCT>(lParam);
+                    var hwndUnder = User32.WindowFromPoint(data.pt);
+                    if (hwndUnder != _popupHwnd && (hwndUnder == IntPtr.Zero ||
+                        User32.GetAncestor(hwndUnder, User32.GA_ROOT) != _popupHwnd))
+                    {
+                        // Marshal back to the UI thread — setting IsOpen on the dispatcher's
+                        // thread is required because ContextMenu is a UI-thread-affine object.
+                        // BeginInvoke (not Invoke) so the hook returns immediately and doesn't
+                        // serialise mouse processing with WPF rendering.
+                        Dispatcher.BeginInvoke(new Action(() =>
+                        {
+                            if (OverlayMenu.IsOpen) OverlayMenu.IsOpen = false;
+                        }));
+                    }
+                }
+                catch
+                {
+                    // Defensive: any exception thrown from a global hook would tear down the
+                    // calling thread (the OS doesn't tolerate hook-proc faults).  Swallow and
+                    // let the click pass through unmolested — at worst the menu stays open
+                    // for one extra click, which the user will notice and try again.
+                }
+            }
+        }
+
+        return User32.CallNextHookEx(_mouseHookHandle, nCode, wParam, lParam);
     }
 
     // ── Drag + persist ────────────────────────────────────────────────────────────────────────
