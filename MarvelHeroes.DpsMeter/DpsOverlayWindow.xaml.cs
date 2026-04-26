@@ -6,6 +6,7 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
+using System.Windows.Threading;
 using Rectangle = System.Windows.Shapes.Rectangle;
 using MarvelHeroes.DpsMeter.Interop;
 using MarvelHeroes.DpsMeter.Services;
@@ -50,6 +51,23 @@ public partial class DpsOverlayWindow : Window
         SourceInitialized += OnSourceInitialized;
         LocationChanged += OnLocationChanged;
         Closing += OnClosingSavePosition;
+
+        // ── Context-menu dismissal repair ─────────────────────────────────────────────────────
+        // The overlay window sets WS_EX_NOACTIVATE and returns MA_NOACTIVATE from its
+        // WM_MOUSEACTIVATE hook so dragging the HUD never steals focus from the game.  Side
+        // effect: WPF's ContextMenu is hosted in a Popup that relies on standard window-
+        // activation / focus-loss tracking to detect outside-click dismissal — with the owner
+        // permanently non-activatable, the popup never receives the "you lost focus, close
+        // yourself" signal, so users reported "I can't close the right-click menu".
+        //
+        // Fix: subscribe to ContextMenu.Opened/Closed and toggle the WS_EX_NOACTIVATE flag
+        // (and the WM_MOUSEACTIVATE intercept — see WndProc below) only while the menu is
+        // open.  When the menu closes (outside click, item click, Escape), the flag is
+        // restored so normal click-without-activation behavior resumes.  This is a transient
+        // state for as long as the user is actively interacting with the menu, so the brief
+        // activation window doesn't cause any focus-stealing complaints.
+        OverlayMenu.Opened += OnOverlayMenuOpened;
+        OverlayMenu.Closed += OnOverlayMenuClosed;
     }
 
     /// <summary>Thread-safe entry point to update the number.  Safe to call from the DpsMeter's
@@ -395,7 +413,15 @@ public partial class DpsOverlayWindow : Window
     {
         // WM_MOUSEACTIVATE with MA_NOACTIVATE = "process the click, but don't bring me to the
         // foreground" — letting the user drag us without yanking focus off the game HUD.
-        if (msg == User32.WM_MOUSEACTIVATE)
+        //
+        // EXCEPT when the right-click menu is open: the WPF Popup hosting the ContextMenu
+        // detects outside-click dismissal via standard focus-loss tracking, which is broken
+        // by MA_NOACTIVATE.  While the menu is open, we let activation flow normally so the
+        // popup can close itself when the user clicks elsewhere.  The Opened/Closed handlers
+        // (OnOverlayMenuOpened / OnOverlayMenuClosed) toggle the matching WS_EX_NOACTIVATE
+        // bit in lockstep — both knobs need to be released for the popup's dismissal flow
+        // to work, then both restored when the menu closes.
+        if (msg == User32.WM_MOUSEACTIVATE && !OverlayMenu.IsOpen)
         {
             handled = true;
             return User32.MA_NOACTIVATE;
@@ -403,10 +429,49 @@ public partial class DpsOverlayWindow : Window
         return IntPtr.Zero;
     }
 
+    /// <summary>Fires when the user right-clicks and the context menu becomes visible.
+    /// Temporarily clears <see cref="User32.WS_EX_NOACTIVATE"/> so the WPF Popup hosting the
+    /// menu can detect outside-click / focus-loss dismissal via the standard Win32 flow.
+    /// Paired with the matching MA_NOACTIVATE bypass in <see cref="WndProc"/>.</summary>
+    private void OnOverlayMenuOpened(object? sender, RoutedEventArgs e)
+    {
+        var hwnd = new WindowInteropHelper(this).Handle;
+        if (hwnd == IntPtr.Zero) return;
+        var ex = User32.GetWindowLongPtr(hwnd, User32.GWL_EXSTYLE);
+        if ((ex & User32.WS_EX_NOACTIVATE) != 0)
+            User32.SetWindowLongPtr(hwnd, User32.GWL_EXSTYLE, ex & ~User32.WS_EX_NOACTIVATE);
+    }
+
+    /// <summary>Fires when the menu closes (outside click, item click, or Escape).  Restores
+    /// <see cref="User32.WS_EX_NOACTIVATE"/> so subsequent overlay drags don't steal focus
+    /// from Marvel Heroes' fullscreen window.  Restoring is idempotent — if the OS happened
+    /// to clear the bit during the menu's lifetime (which it shouldn't), we just put it back.</summary>
+    private void OnOverlayMenuClosed(object? sender, RoutedEventArgs e)
+    {
+        var hwnd = new WindowInteropHelper(this).Handle;
+        if (hwnd == IntPtr.Zero) return;
+        var ex = User32.GetWindowLongPtr(hwnd, User32.GWL_EXSTYLE);
+        if ((ex & User32.WS_EX_NOACTIVATE) == 0)
+            User32.SetWindowLongPtr(hwnd, User32.GWL_EXSTYLE, ex | User32.WS_EX_NOACTIVATE);
+    }
+
     // ── Drag + persist ────────────────────────────────────────────────────────────────────────
 
     private void RootBorder_OnMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
+        // Belt-and-suspenders dismissal: if the right-click menu is open and the user
+        // left-clicks anywhere on the overlay (outside the menu's popup), close it
+        // explicitly and swallow the click — don't also start a drag, otherwise the user
+        // would have to click twice to dismiss.  The Opened/Closed activation-toggle path
+        // SHOULD already cover this via the standard popup-dismissal flow, but if there's
+        // any race in WS_EX_NOACTIVATE propagation this catches it.
+        if (OverlayMenu.IsOpen)
+        {
+            OverlayMenu.IsOpen = false;
+            e.Handled = true;
+            return;
+        }
+
         // DragMove throws if called on a right-click or when the window is minimized. Guarding
         // the button explicitly avoids that (ChangedButton is already filtered by the event
         // name, but belt-and-braces in case the XAML is ever retargeted).
@@ -529,6 +594,57 @@ public partial class DpsOverlayWindow : Window
         _bossOnlyMode = false;
         BossOnlyToggled?.Invoke(false);
         TrySavePosition();
+    }
+
+    // ── Restart-sniffer escape hatch ──────────────────────────────────────────────────────────
+    // Surfaced as a parameterless event (no enabled/disabled bool, unlike BossOnlyToggled)
+    // because there's no two-state contract — clicking it always means "do it now".  Presenter
+    // owns the actual Stop()+TryStart() because it's the only place that holds the sniffer
+    // reference.
+
+    /// <summary>Fires when the user clicks the "Restart sniffer" context-menu item.  Subscribed
+    /// by <c>DpsOverlayPresenter</c>, which marshals the actual restart onto a worker thread so
+    /// the Npcap close+reopen (~100 ms across all open adapters) doesn't freeze the UI.</summary>
+    public event Action? RestartSnifferRequested;
+
+    /// <summary>UI-thread guard: the menu item is disabled for ~3 s after a click so a user
+    /// rapidly clicking "Restart" can't queue up multiple Stop/Start cycles racing on the same
+    /// adapter list.  The presenter doesn't see the rapid clicks because they're swallowed
+    /// here.</summary>
+    private DispatcherTimer? _restartCooldownTimer;
+
+    private void RestartSnifferMenuItem_OnClick(object sender, RoutedEventArgs e)
+    {
+        if (!RestartSnifferMenuItem.IsEnabled) return;
+
+        RestartSnifferMenuItem.IsEnabled = false;
+        // Visual cue while the click is in flight — restored in the cooldown tick below.  Header
+        // doubles as a status read-out so the user knows their click was registered without
+        // needing to open the diagnostic log.
+        RestartSnifferMenuItem.Header = "Restarting sniffer…";
+
+        RestartSnifferRequested?.Invoke();
+
+        // Re-enable after a short cooldown.  3 s is long enough for the worker thread's
+        // Stop() + TryStart() to complete on a typical 9-adapter Realtek setup (measured
+        // ~100 ms) plus a buffer for slow systems / antivirus interference, and short enough
+        // that the user doesn't lose track of the menu state.  DispatcherTimer (not Task.Delay)
+        // because we need the tick on the UI thread to flip IsEnabled safely.
+        _restartCooldownTimer?.Stop();
+        _restartCooldownTimer = new DispatcherTimer(
+            TimeSpan.FromSeconds(3),
+            DispatcherPriority.Background,
+            OnRestartCooldownElapsed,
+            Dispatcher);
+        _restartCooldownTimer.Start();
+    }
+
+    private void OnRestartCooldownElapsed(object? sender, EventArgs e)
+    {
+        _restartCooldownTimer?.Stop();
+        _restartCooldownTimer = null;
+        RestartSnifferMenuItem.Header = "Restart sniffer (fix stuck DPS)";
+        RestartSnifferMenuItem.IsEnabled = true;
     }
 
     /// <summary>

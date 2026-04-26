@@ -101,6 +101,47 @@ public sealed class DpsOverlayPresenter : IDisposable
             {
                 if (_meter != null) _meter.BossOnlyMode = enabled;
             };
+
+            // Right-click → "Restart sniffer (fix stuck DPS)" → here.  This is the user-visible
+            // recovery path for the recurring Npcap stall on Realtek 2.5GbE NICs (PowerResultStats
+            // Total frozen at the same value across heartbeats while the player is in active
+            // combat — the pcap handle silently stops surfacing packets even though traffic is
+            // still flowing on the wire).
+            //
+            // Implementation runs on a worker thread because Stop()+TryStart() blocks while
+            // SharpPcap drains in-flight callbacks and re-enumerates devices (~100 ms on the
+            // typical 9-adapter setup; cold start has been observed up to 800 ms when the
+            // adapter list itself is being recomputed by Windows).  We MUST NOT block the WPF
+            // dispatcher for that long — the overlay would freeze and the user's foreground-
+            // visibility watcher would lag, defeating the auto-hide UX.
+            //
+            // The event subscriptions on _sniffer (DamageDealt, EntityCreated, etc.) hang off the
+            // MhMissionSniffer instance directly, so the restart is transparent to the meter:
+            // only the in-flight TCP reassembly buffers are discarded (acceptable — they were
+            // already starved of new packets, that's why the user is restarting).  After
+            // TryStart() returns, the next packet that arrives flows back into the same meter
+            // state with all 60s windows / encounter accumulator / owner pin intact.
+            _window.RestartSnifferRequested += () =>
+            {
+                _ = System.Threading.Tasks.Task.Run(() =>
+                {
+                    try
+                    {
+                        ForceAppendLog("DpsOverlayPresenter: user-requested sniffer restart — stopping...");
+                        _sniffer.Stop();
+                        bool ok = _sniffer.TryStart();
+                        if (ok)
+                            ForceAppendLog($"DpsOverlayPresenter: sniffer restarted successfully (open device count={_sniffer.OpenedDeviceCount}).");
+                        else
+                            ForceAppendLog($"DpsOverlayPresenter: sniffer restart FAILED: {_sniffer.StartFailureReason ?? "unknown reason"}. The meter will not receive packets until you fix the underlying issue (Npcap reinstall, run as administrator, etc.).");
+                    }
+                    catch (Exception ex)
+                    {
+                        ForceAppendLog($"DpsOverlayPresenter: sniffer restart threw: {ex.GetType().Name}: {ex.Message}");
+                    }
+                });
+            };
+
             _window.ShowWithoutActivating();
 
             // Decay timer: poll CurrentDps at 4 Hz so the overlay fades back to "—" within a
@@ -293,6 +334,22 @@ public sealed class DpsOverlayPresenter : IDisposable
             File.AppendAllText(DiagnosticLogPath, $"[{DateTime.UtcNow:HH:mm:ss.fff}] {line}{Environment.NewLine}");
         }
         catch { /* log I/O errors swallowed — don't let logging crash the presenter */ }
+    }
+
+    /// <summary>Bypass-the-gate writer for one-shot recovery / lifecycle events that MUST reach
+    /// disk regardless of <see cref="DpsOverlaySettingsFile.IsLoggingEnabled"/>.  Currently only
+    /// the user-initiated "Restart sniffer" path uses this — when a user reports a stall and
+    /// we need to know whether their click triggered a clean restart or hit an Npcap error,
+    /// we don't want their <c>"LoggingEnabled": false</c> setting to silently swallow the answer.
+    /// Don't use for per-event traffic; keep this for rare lifecycle markers only.</summary>
+    private static void ForceAppendLog(string line)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(DiagnosticLogPath)!);
+            File.AppendAllText(DiagnosticLogPath, $"[{DateTime.UtcNow:HH:mm:ss.fff}] {line}{Environment.NewLine}");
+        }
+        catch { /* best-effort */ }
     }
 
     public void Dispose() => Stop();

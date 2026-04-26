@@ -44,6 +44,23 @@
                           Checked="BossOnlyMenuItem_OnChecked"
                           Unchecked="BossOnlyMenuItem_OnUnchecked"/>
                 <Separator/>
+                <!--
+                    Recovery escape hatch when the Npcap capture thread has stalled (high-throughput
+                    bursts on Realtek 2.5GbE NICs occasionally drop the pcap handle into a state
+                    where it stops surfacing packets even though traffic is still flowing).
+                    Symptom in the log: PowerResultStats: Total= … stays frozen on the same value
+                    across heartbeats while the player is clearly still in combat.
+
+                    Click handler routes through the presenter so the actual Stop()+TryStart()
+                    happens off the UI thread (Npcap close+reopen across all 9 adapters takes
+                    ~100 ms, fast but not zero).  All event subscriptions (DamageDealt etc.) hang
+                    off the MhMissionSniffer instance directly, so the restart is transparent to
+                    the meter — only the in-flight TCP reassembly buffers get discarded.
+                -->
+                <MenuItem x:Name="RestartSnifferMenuItem"
+                          Header="Restart sniffer (fix stuck DPS)"
+                          Click="RestartSnifferMenuItem_OnClick"/>
+                <Separator/>
                 <MenuItem x:Name="ExitMenuItem"
                           Header="Exit"
                           Click="ExitMenuItem_OnClick"/>
