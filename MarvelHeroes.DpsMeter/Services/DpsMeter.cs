@@ -730,6 +730,7 @@ public sealed class DpsMeter : IDisposable
                 _encounterTotalsPerOwner.Clear();
                 _engagedBossEntityIds.Clear();
                 _lastHitPerEngagedBoss.Clear();
+                _recentlyRemovedEntityIds.Clear();
                 _encounterStartUtc = DateTime.MinValue;
                 _encounterEndedUtc = DateTime.MinValue;
                 _lastEncounterDamageUtc = DateTime.MinValue;
@@ -817,6 +818,43 @@ public sealed class DpsMeter : IDisposable
     /// (final breakdown on screen, awaiting the next boss hit to clear and start fresh).
     /// Lock <see cref="_sync"/>.</summary>
     private DateTime _encounterEndedUtc = DateTime.MinValue;
+
+    /// <summary>Grace window applied to entity ids stamped in <see cref="_recentlyRemovedEntityIds"/>.
+    /// Boss-classified hits whose <c>TargetEntityId</c> was removed within this window do
+    /// NOT clear a frozen encounter — they're treated as in-flight DOTs / projectile ticks
+    /// from before the kill arrived, NOT as the user starting a new fight.</summary>
+    private static readonly TimeSpan RecentlyRemovedGrace = TimeSpan.FromSeconds(2);
+
+    /// <summary>Entity ids that recently emitted an EntityKilled / EntityDestroyed event,
+    /// keyed on entity id, value is the removal UTC time.  Two failure modes motivate
+    /// keeping this map (live observation 2026-04-26 in Hightown patrol):
+    ///
+    /// <para>(a) <b>Lingering DOT / projectile on the just-killed boss.</b>  Self casts a
+    /// poison/bleed at T-100 ms, boss dies at T (encounter freezes), DOT tick lands at T+1 ms.
+    /// The kill event invalidates the per-entity prototype cache, so the lingering tick
+    /// hits the boss filter's "unknown prototype" optimistic-admit path and would otherwise
+    /// flow into the freeze-clear branch — wiping the breakdown the user is reading. Live
+    /// log: <c>encounter ended (selfTotal=14.2M) — frozen</c> followed 1 ms later by
+    /// <c>encounter cleared</c>, followed by <c>encounter ended (selfTotal=0) — auto-cleared</c>
+    /// on the same entity id.</para>
+    ///
+    /// <para>(b) <b>Peer-fired ghost-spawn that dies in 0 ms.</b>  After a real frozen
+    /// kill, a peer fires at an entity that the server spawns and instantly destroys
+    /// (cleave splash on a dying mob, environmental hazard on the corpse, etc.).  The
+    /// optimistic admit path engages the entity, the encounter restarts on a peer hit,
+    /// and the very next packet is the destroy — auto-cleared with <c>selfTotal=0</c>.
+    /// Net effect: user's legitimate 37.9 M selfTotal breakdown vanishes 2.8 s after the
+    /// real kill because a peer happened to fire at a corpse.</para>
+    ///
+    /// <para>By stamping every engaged-boss removal here and consulting it from the
+    /// freeze-clear gate in <see cref="OnDamageDealt"/>, both failure modes silently
+    /// resolve: the freeze is preserved, the user keeps the breakdown they're reading.</para>
+    ///
+    /// <para>Bounded growth — pruned opportunistically inside <see cref="OnEngagedEntityRemoved"/>
+    /// (sweep on every removal drops entries older than <see cref="RecentlyRemovedGrace"/>),
+    /// so dict size tracks the kill rate of the last ~2 s (typically &lt; 100 entries even
+    /// in Holo-Sim crowds).  Lock <see cref="_sync"/>.</para></summary>
+    private readonly Dictionary<ulong, DateTime> _recentlyRemovedEntityIds = new();
 
     /// <summary>UTC time of the last damage event (any owner — self OR peer) that flowed into
     /// <see cref="_encounterTotalsPerOwner"/>.  Updated on every accumulator add in
@@ -2336,40 +2374,84 @@ public sealed class DpsMeter : IDisposable
             //         encounter leaderboard.
             if (_bossOnlyMode)
             {
+                bool encounterSkipped = false;
+
                 if (_encounterEndedUtc != DateTime.MinValue)
                 {
-                    int frozenOwners = _encounterTotalsPerOwner.Count;
-                    _encounterTotalsPerOwner.Clear();
-                    _engagedBossEntityIds.Clear();
-                    _lastHitPerEngagedBoss.Clear();
-                    _encounterStartUtc = DateTime.MinValue;
-                    _encounterEndedUtc = DateTime.MinValue;
-                    _lastEncounterDamageUtc = DateTime.MinValue;
-                    Diagnostic?.Invoke($"DpsMeter: encounter cleared (new boss hit after frozen fight, {frozenOwners} owners discarded) — starting fresh");
+                    // FROZEN STATE — protect the breakdown the user is reading from
+                    // post-kill incidentals.  Two failure modes are silenced here (see
+                    // _recentlyRemovedEntityIds field doc for the full live-log evidence):
+                    //
+                    //   (a) Peer-fired hit on ANY entity while we're frozen.  Peers fire
+                    //       at corpses, ghost-spawns, cleaves, splashes — none of those
+                    //       represent the LOCAL user starting a new fight, and the user
+                    //       has no agency over them.  Wiping the freeze on a peer's hit
+                    //       was producing the "leaderboard disappears for no reason 2-3 s
+                    //       after my kill" symptom on Hightown patrol.
+                    //
+                    //   (b) Self lingering DOT / projectile tick on the just-killed boss.
+                    //       Damage was applied seconds before the kill but the tick lands
+                    //       1 ms after EntityKilled invalidated the prototype cache, so
+                    //       the boss filter's optimistic-admit path lets it through and
+                    //       the freeze-clear branch fires on the user's OWN trailing hit
+                    //       (which then auto-clears as selfTotal=0 on the very next
+                    //       destroy event — net: the user wipes their own breakdown).
+                    //       _recentlyRemovedEntityIds remembers the kill timestamp;
+                    //       hits within RecentlyRemovedGrace are treated as trailing damage,
+                    //       not as a fresh fight.
+                    //
+                    // Net rule: the freeze is cleared ONLY when the local user lands a
+                    // boss-classified hit on a target that has NOT been killed/destroyed
+                    // in the last RecentlyRemovedGrace.  Anything else preserves the
+                    // freeze; the encounter accumulator is left untouched (no engage,
+                    // no accumulate, no per-target timestamp refresh).
+                    bool selfClearsFreeze =
+                        ownerIsSelf
+                        && (e.TargetEntityId == 0
+                            || !WasRecentlyRemovedLocked(e.TargetEntityId, now));
+
+                    if (!selfClearsFreeze)
+                    {
+                        encounterSkipped = true;
+                    }
+                    else
+                    {
+                        int frozenOwners = _encounterTotalsPerOwner.Count;
+                        _encounterTotalsPerOwner.Clear();
+                        _engagedBossEntityIds.Clear();
+                        _lastHitPerEngagedBoss.Clear();
+                        _encounterStartUtc = DateTime.MinValue;
+                        _encounterEndedUtc = DateTime.MinValue;
+                        _lastEncounterDamageUtc = DateTime.MinValue;
+                        Diagnostic?.Invoke($"DpsMeter: encounter cleared (self landed boss hit on entity {e.TargetEntityId} after frozen fight, {frozenOwners} owners discarded) — starting fresh");
+                    }
                 }
 
-                if (_encounterStartUtc == DateTime.MinValue)
+                if (!encounterSkipped)
                 {
-                    _encounterStartUtc = now;
-                    Diagnostic?.Invoke($"DpsMeter: encounter started (firstTarget={e.TargetEntityId}, firstOwner={scoringOwner})");
-                }
+                    if (_encounterStartUtc == DateTime.MinValue)
+                    {
+                        _encounterStartUtc = now;
+                        Diagnostic?.Invoke($"DpsMeter: encounter started (firstTarget={e.TargetEntityId}, firstOwner={scoringOwner})");
+                    }
 
-                if (e.TargetEntityId != 0)
-                {
-                    _engagedBossEntityIds.Add(e.TargetEntityId);
-                    // Per-target last-hit timestamp drives the EngagedBossIdleEviction sweep
-                    // in Tick — without this, missed kill events would let a long-dead boss
-                    // sit in the engaged set indefinitely and prevent the next-fight clear.
-                    _lastHitPerEngagedBoss[e.TargetEntityId] = now;
-                }
+                    if (e.TargetEntityId != 0)
+                    {
+                        _engagedBossEntityIds.Add(e.TargetEntityId);
+                        // Per-target last-hit timestamp drives the EngagedBossIdleEviction sweep
+                        // in Tick — without this, missed kill events would let a long-dead boss
+                        // sit in the engaged set indefinitely and prevent the next-fight clear.
+                        _lastHitPerEngagedBoss[e.TargetEntityId] = now;
+                    }
 
-                _encounterTotalsPerOwner.TryGetValue(scoringOwner, out long encPrev);
-                _encounterTotalsPerOwner[scoringOwner] = encPrev + dmg;
-                // Bump the stall watchdog — Tick uses this to declare the fight over if
-                // EVERY player goes silent for EncounterStallTimeout (boss despawn, AOI
-                // exit, kill-event lost in transit, etc.).  Any-owner timestamp on purpose;
-                // see _lastEncounterDamageUtc field doc.
-                _lastEncounterDamageUtc = now;
+                    _encounterTotalsPerOwner.TryGetValue(scoringOwner, out long encPrev);
+                    _encounterTotalsPerOwner[scoringOwner] = encPrev + dmg;
+                    // Bump the stall watchdog — Tick uses this to declare the fight over if
+                    // EVERY player goes silent for EncounterStallTimeout (boss despawn, AOI
+                    // exit, kill-event lost in transit, etc.).  Any-owner timestamp on purpose;
+                    // see _lastEncounterDamageUtc field doc.
+                    _lastEncounterDamageUtc = now;
+                }
             }
 
             // ── 3. Pick "you" ────────────────────────────────────────────────────────────────
@@ -2396,15 +2478,75 @@ public sealed class DpsMeter : IDisposable
             }
             else
             {
+                // Heuristic fallback: pick the highest-damager in the 60s window.  Two
+                // safety filters when we have a persisted self-dbId on file:
+                //   (1) STRONGLY PREFER the entity whose _dbIdByAvatarId matches _selfDbId,
+                //       even if its 60s damage is smaller — that's the true local player and
+                //       the persisted dbId is server-authoritative ground truth.  This is
+                //       what unsticks the meter from peer-hijack after a user-driven sniffer
+                //       restart in a busy area where peers out-DPS the user (Hightown patrol,
+                //       Pryde's Parade, Midtown — see live-log evidence 2026-04-26 17:12:56
+                //       onward in dps-meter.log: heuristic flipped self through Sunera /
+                //       Ghostwulf / Takasten / Meandean1216 because user's own avatar 259235
+                //       had less 60s damage than several peers, and the persisted dbId was
+                //       loaded from disk but never consulted by the heuristic.)
+                //   (2) If no entity matches _selfDbId (we genuinely don't know our avatar
+                //       yet — fresh launch mid-session before any local power activation),
+                //       still pick top damager BUT skip candidates whose dbId is a known
+                //       PEER dbId (i.e. a non-zero dbId that doesn't match _selfDbId).
+                //       Unmapped candidates (dbId=0, no EntityCreate yet) are still allowed
+                //       since they MIGHT be us.
+                ulong selfDbSnapshot = _selfDbId;
                 ulong topOwner = 0; long topTotal = 0;
+                ulong selfMatchOwner = 0; long selfMatchTotal = 0;
+                long topRejectedPeer = 0; ulong topRejectedDbId = 0;
                 foreach (var kv in _totalsPerOwner)
                 {
+                    bool isKnownDb = _dbIdByAvatarId.TryGetValue(kv.Key, out ulong candidateDb)
+                                     && candidateDb != 0;
+
+                    if (selfDbSnapshot != 0 && isKnownDb && candidateDb == selfDbSnapshot)
+                    {
+                        if (kv.Value > selfMatchTotal)
+                        {
+                            selfMatchTotal = kv.Value;
+                            selfMatchOwner = kv.Key;
+                        }
+                        // Self-matched candidates ALSO compete in topOwner so they can win on
+                        // damage too — keeps existing behavior for the in-bounds case.
+                    }
+                    else if (selfDbSnapshot != 0 && isKnownDb && candidateDb != selfDbSnapshot)
+                    {
+                        // Known peer — skip from heuristic top-damager pool.  Track the
+                        // largest rejected peer so we can log a one-shot diagnostic when
+                        // the safety net actually kicks in (otherwise we'd be silent and
+                        // the symptom of "meter shows wrong hero" would still look like a
+                        // mystery in post-hoc log reads).
+                        if (kv.Value > topTotal && kv.Value > topRejectedPeer)
+                        {
+                            topRejectedPeer = kv.Value;
+                            topRejectedDbId = candidateDb;
+                        }
+                        continue;
+                    }
+
                     if (kv.Value > topTotal) { topTotal = kv.Value; topOwner = kv.Key; }
                 }
-                if (topOwner != _likelySelfOwnerId)
+
+                // Self-match wins outright when _selfDbId is set; otherwise fall back to
+                // top damager (with peers already filtered out above).
+                ulong chosenOwner = selfMatchOwner != 0 ? selfMatchOwner : topOwner;
+                long chosenTotal = selfMatchOwner != 0 ? selfMatchTotal : topTotal;
+
+                if (chosenOwner != _likelySelfOwnerId && chosenOwner != 0)
                 {
-                    Diagnostic?.Invoke($"DpsMeter: self-owner flipped {_likelySelfOwnerId} -> {topOwner} (60s total = {topTotal}, heuristic)");
-                    _likelySelfOwnerId = topOwner;
+                    string flipReason = selfMatchOwner != 0
+                        ? $"self-dbId match 0x{selfDbSnapshot:X16}"
+                        : (selfDbSnapshot != 0 && topRejectedPeer != 0
+                            ? $"heuristic top-damager (peer dbId 0x{topRejectedDbId:X16} with {topRejectedPeer} dmg rejected as known non-self)"
+                            : "heuristic");
+                    Diagnostic?.Invoke($"DpsMeter: self-owner flipped {_likelySelfOwnerId} -> {chosenOwner} (60s total = {chosenTotal}, {flipReason})");
+                    _likelySelfOwnerId = chosenOwner;
                     _likelySelfChosenAt = now;
                 }
             }
@@ -2714,19 +2856,40 @@ public sealed class DpsMeter : IDisposable
 
             if (_localAvatarEntityIds.Count == 0)
             {
+                // Same self-dbId-aware filtering as OnDamageDealt's heuristic-flip path —
+                // see the comment block there for the full rationale.  Without this filter,
+                // the wall-clock re-elect would override OnDamageDealt's filtered choice
+                // with an unfiltered "top damager" pick once per second.
+                ulong selfDbSnapshot = _selfDbId;
                 ulong topOwner = 0; long topTotal = 0;
+                ulong selfMatchOwner = 0; long selfMatchTotal = 0;
                 foreach (var kv in _totalsPerOwner)
+                {
+                    bool isKnownDb = _dbIdByAvatarId.TryGetValue(kv.Key, out ulong candidateDb)
+                                     && candidateDb != 0;
+                    if (selfDbSnapshot != 0 && isKnownDb && candidateDb == selfDbSnapshot)
+                    {
+                        if (kv.Value > selfMatchTotal) { selfMatchTotal = kv.Value; selfMatchOwner = kv.Key; }
+                    }
+                    else if (selfDbSnapshot != 0 && isKnownDb && candidateDb != selfDbSnapshot)
+                    {
+                        continue;
+                    }
                     if (kv.Value > topTotal) { topTotal = kv.Value; topOwner = kv.Key; }
+                }
+
+                ulong chosenOwner = selfMatchOwner != 0 ? selfMatchOwner : topOwner;
+                long chosenTotal = selfMatchOwner != 0 ? selfMatchTotal : topTotal;
 
                 bool currentHasZero   = _likelySelfOwnerId == 0 || currentOwnerTotal == 0;
-                bool topDominates     = topOwner != 0 && topTotal > currentOwnerTotal * 1.5;  // hysteresis
+                bool topDominates     = chosenOwner != 0 && chosenTotal > currentOwnerTotal * 1.5;  // hysteresis
                 bool dictIsEmpty      = _totalsPerOwner.Count == 0;
 
-                if (!dictIsEmpty && topOwner != _likelySelfOwnerId && (currentHasZero || topDominates))
+                if (!dictIsEmpty && chosenOwner != _likelySelfOwnerId && (currentHasZero || topDominates))
                 {
                     reelectOldTotal = currentOwnerTotal;
-                    reelectNewTotal = topTotal;
-                    _likelySelfOwnerId = topOwner;
+                    reelectNewTotal = chosenTotal;
+                    _likelySelfOwnerId = chosenOwner;
                     _likelySelfChosenAt = nowUtc;
                     reelected = true;
                 }
@@ -2886,31 +3049,50 @@ public sealed class DpsMeter : IDisposable
 
     private void OnRegionChanged(object? sender, RegionChangedEvent e)
     {
-        // Region changes and user-requested sniffer restarts both want the same per-region
-        // wipe semantics — same fields cleared, same identity caches preserved.  The only
-        // difference is the diagnostic log lines, so we hand the reason in and let the
-        // shared helper format both the "starting" and "completed" log lines.
+        // Real region change: zoning to a different region. The currently-pinned avatar
+        // entity is no longer guaranteed to be valid (the user may have swapped heroes
+        // mid-zone, or the avatar id namespace was rotated by the server) so identity
+        // pins are wiped along with damage state. The next NetMessageLocalPlayer +
+        // power activation in the new region will rebuild the authoritative pin.
         ResetPerRegionState(
             startReason: "region changed",
-            endContext: $"regionProtoId={e.RegionPrototypeId}");
+            endContext: $"regionProtoId={e.RegionPrototypeId}",
+            wipeIdentity: true);
     }
 
-    /// <summary>Wipes all per-region damage / encounter / owner-pin state, matching the
-    /// semantics of a region change.  Public entry point used by the presenter when the
-    /// user clicks "Restart sniffer (fix stuck DPS)" — the user expects a fresh start
-    /// (empty leaderboard, zero totals, no carried-over fight) once the pcap handle is
-    /// recycled, otherwise the recovery would feel like a no-op even after the heartbeat
-    /// resumes.  Identity caches (<c>_heroNameByOwnerId</c>, dbId bindings, nickname map,
-    /// per-hero personal-best max hit) are deliberately KEPT — peers don't lose their
-    /// identification just because we recycled our capture handle, and the persisted
-    /// per-hero PB shouldn't reset every time the user pokes the recovery button.
+    /// <summary>Wipes per-region damage / encounter state in response to the user
+    /// clicking "Restart sniffer (fix stuck DPS)".  The user expects a fresh start
+    /// (empty leaderboard, zero totals, no carried-over fight) once the pcap handle
+    /// is recycled, otherwise the recovery would feel like a no-op even after the
+    /// heartbeat resumes.  Identity caches (<c>_heroNameByOwnerId</c>, dbId bindings,
+    /// nickname map, per-hero personal-best max hit) are deliberately KEPT — peers
+    /// don't lose their identification just because we recycled our capture handle,
+    /// and the persisted per-hero PB shouldn't reset every time the user pokes the
+    /// recovery button.
+    ///
+    /// <para>Crucially, <c>_likelySelfOwnerId</c> / <c>_localAvatarEntityIds</c> /
+    /// <c>_localPlayerEntityId</c> are ALSO kept across this call — they're identity,
+    /// not damage data.  The sniffer's own <c>_localPlayerEntityId</c> gets wiped by
+    /// <c>Stop()</c>+<c>TryStart()</c> and the server does NOT re-emit
+    /// <c>NetMessageLocalPlayer</c> on a meter restart-without-zone (it's only sent
+    /// on initial connect / region change), so the sniffer's
+    /// <c>LocalAvatarObserved</c> event will NOT re-fire post-restart and our
+    /// authoritative pin would never be rebuilt if we cleared it here.  Live-log
+    /// evidence: dps-meter.log 2026-04-26 17:12:56 — heuristic-flip storm started
+    /// chasing peers Takasten(Magneto) / Ghostwulf(Ghost Rider) / Meandean1216(Thor)
+    /// because the user's avatar entity (Bandit, id 259235) was no longer in
+    /// <c>_localAvatarEntityIds</c> after a user-driven restart.  Keeping the pin
+    /// here makes the next damage event from the user's avatar hit the authoritative
+    /// branch in <see cref="OnDamageDealt"/> and the misattribution disappears.</para>
+    ///
     /// <para>Safe to call from any thread.  Acquires <c>_sync</c> internally; do NOT
     /// call from inside an existing <c>_sync</c>-held block (would deadlock).</para>
     /// </summary>
     public void ResetForUserRestart() =>
         ResetPerRegionState(
             startReason: "user-requested sniffer restart",
-            endContext: null);
+            endContext: null,
+            wipeIdentity: false);
 
     /// <summary>Shared body of <see cref="OnRegionChanged"/> and <see cref="ResetForUserRestart"/>.
     /// Clears every per-region scoring map, dedup set, and encounter accumulator inside
@@ -2919,7 +3101,7 @@ public sealed class DpsMeter : IDisposable
     /// immediately to "—" / empty leaderboard.  Wraps the work in matching diagnostic log
     /// lines so a post-incident log read can tell a region-change wipe from a user-driven
     /// restart wipe.</summary>
-    private void ResetPerRegionState(string startReason, string? endContext)
+    private void ResetPerRegionState(string startReason, string? endContext, bool wipeIdentity)
     {
         // Log the start of the wipe first so that post-incident log reads can distinguish
         // a real reset event from "user was in-place the whole session" — the cleared
@@ -2940,8 +3122,16 @@ public sealed class DpsMeter : IDisposable
             // accumulator's region-change wipe in boss mode for symmetry).
             _sessionTotalsPerOwner.Clear();
             _instant.Clear();
-            _likelySelfOwnerId = 0;
-            _likelySelfChosenAt = default;
+            // Identity pins are wiped only on real region changes.  See ResetForUserRestart
+            // doc comment for the live-log rationale (sniffer recycle does NOT re-fire
+            // NetMessageLocalPlayer, so wiping here permanently strands the meter in
+            // heuristic-flip mode and the user's row gets hijacked by whichever peer is
+            // top damager).
+            if (wipeIdentity)
+            {
+                _likelySelfOwnerId = 0;
+                _likelySelfChosenAt = default;
+            }
             CurrentDps = 0;
             CurrentOwnerTotal60s = 0;
             CurrentOwnerSessionTotal = 0;
@@ -3003,7 +3193,13 @@ public sealed class DpsMeter : IDisposable
             //   • _localAvatarEntityIds → only the CURRENTLY in-play avatar is valid per
             //     region (the local player's other avatars are removed from world until
             //     AvatarInPlay swap).  Repopulates immediately via InventoryMove.
-            _localAvatarEntityIds.Clear();
+            //   …UNLESS this is a user-driven restart: the sniffer's internal local-player
+            //   tracking is gone and won't be rebuilt without a fresh NetMessageLocalPlayer
+            //   (server only sends those on connect / region change), so wiping our copy
+            //   would mean the next 60+ minutes of play falls back to the heuristic
+            //   "top damager wins" path and gets hijacked by peers.
+            if (wipeIdentity)
+                _localAvatarEntityIds.Clear();
             _pendingAvatarBindings.Clear();
             _pendingDbIdBindings.Clear();
 
@@ -3023,6 +3219,7 @@ public sealed class DpsMeter : IDisposable
             _encounterTotalsPerOwner.Clear();
             _engagedBossEntityIds.Clear();
             _lastHitPerEngagedBoss.Clear();
+            _recentlyRemovedEntityIds.Clear();
             _encounterStartUtc = DateTime.MinValue;
             _encounterEndedUtc = DateTime.MinValue;
             _lastEncounterDamageUtc = DateTime.MinValue;
@@ -3042,9 +3239,21 @@ public sealed class DpsMeter : IDisposable
         // cache would defeat the purpose of zeroing the leaderboard if a peer's next hit got
         // attributed via a cached protoIdx without re-emitting the first-hit diagnostic.
         _prototypeByEntityId.Clear();
+
+        // When identity is kept (user-driven restart), the surviving _likelySelfOwnerId
+        // points at the same avatar but its UI-side numbers were just wiped above.  Re-
+        // syncing here makes the next paint immediately show the correct hero
+        // title / Max hit and an empty 60s window — without this, the title would briefly
+        // flicker through "" until the next damage event repaints.
+        if (!wipeIdentity)
+            RefreshSelfAfterPinFlip();
+
         DpsChanged?.Invoke(this, EventArgs.Empty);
         string trailing = endContext == null ? "" : $" ({endContext})";
-        Diagnostic?.Invoke($"DpsMeter: {startReason}{trailing} — meter reset");
+        string identityNote = wipeIdentity
+            ? ""
+            : " — identity pin preserved (user-restart, sniffer cannot re-emit NetMessageLocalPlayer mid-session)";
+        Diagnostic?.Invoke($"DpsMeter: {startReason}{trailing} — meter reset{identityNote}");
     }
 
     private void OnEntityKilled(object? sender, EntityKillEvent e)
@@ -3117,6 +3326,25 @@ public sealed class DpsMeter : IDisposable
     // now persists indefinitely and is only retired by explicit "user moved on" events:
     // new boss hit (encounter cleared in OnDamageDealt), region change, mode toggle, Reset().
 
+    /// <summary>Lock-asserted helper: returns <c>true</c> if <paramref name="entityId"/> was
+    /// removed (killed/destroyed) within <see cref="RecentlyRemovedGrace"/> of
+    /// <paramref name="now"/>.  Used by the freeze-clear gate in <see cref="OnDamageDealt"/>
+    /// to suppress lingering-DOT / trailing-projectile hits on a just-killed boss from
+    /// wiping the frozen breakdown.  Caller must hold <see cref="_sync"/>.
+    ///
+    /// <para>If the entry is older than the grace window, it's removed in-place (lazy
+    /// cleanup that complements the size-triggered sweep in
+    /// <see cref="OnEngagedEntityRemoved"/>).  Net effect: dict size tracks the kill rate
+    /// of the last ~2 s plus at most ~32 stragglers awaiting the next removal sweep.</para></summary>
+    private bool WasRecentlyRemovedLocked(ulong entityId, DateTime now)
+    {
+        if (!_recentlyRemovedEntityIds.TryGetValue(entityId, out DateTime stampedAt))
+            return false;
+        if (now - stampedAt < RecentlyRemovedGrace) return true;
+        _recentlyRemovedEntityIds.Remove(entityId);
+        return false;
+    }
+
     /// <summary>Common path for boss-death detection — both <see cref="MhMissionSniffer.EntityKilled"/>
     /// (explicit kill notification) and <see cref="MhMissionSniffer.EntityDestroyed"/> (catch-all
     /// removal) funnel here.  We process the union because empirically some boss types only emit
@@ -3147,6 +3375,29 @@ public sealed class DpsMeter : IDisposable
             // this, a stale per-target timestamp would linger and the eviction sweep in
             // Tick could spuriously "evict" an already-killed entity.
             _lastHitPerEngagedBoss.Remove(entityId);
+
+            // Stamp the removal time in the recently-removed grace map.  Subsequent
+            // damage events targeting this entityId within RecentlyRemovedGrace will
+            // be treated as in-flight DOT / projectile trailing-damage and skipped
+            // by the freeze-clear gate in OnDamageDealt — see _recentlyRemovedEntityIds
+            // field doc for the full rationale (Hightown-patrol / Pryde-Parade live-log
+            // evidence, 2026-04-26).  Opportunistic prune keeps dict size bounded.
+            _recentlyRemovedEntityIds[entityId] = utcTime;
+            if (_recentlyRemovedEntityIds.Count > 32)
+            {
+                DateTime cutoff = utcTime - RecentlyRemovedGrace;
+                List<ulong>? toDrop = null;
+                foreach (var kv in _recentlyRemovedEntityIds)
+                {
+                    if (kv.Value < cutoff)
+                    {
+                        toDrop ??= new List<ulong>();
+                        toDrop.Add(kv.Key);
+                    }
+                }
+                if (toDrop != null)
+                    foreach (ulong stale in toDrop) _recentlyRemovedEntityIds.Remove(stale);
+            }
 
             // Last engaged boss just died.  Two outcomes depending on whether SELF actually
             // participated in this fight:
@@ -4180,6 +4431,22 @@ public sealed class DpsMeter : IDisposable
         // RenderTopHeroes (rather than picking up a peer's nickname).
         if (ownerEntityId != 0 && ownerEntityId == _likelySelfOwnerId)
         {
+            // Conflict guard: if THIS entity has a known dbId binding AND that binding
+            // does NOT match our persisted _selfDbId, then _likelySelfOwnerId is currently
+            // pointing at a peer (heuristic-flip path mispinned, or a stale pin survived
+            // a region change before the safety nets in OnDamageDealt / Tick fixed it).
+            // In that case the `nickname` field already holds the peer's real
+            // _playerNameByDbId entry (set above by the direct dbId lookup) — just return
+            // it as-is and skip the self-fallback that would overwrite it with our own
+            // nickname.  This is the structural defense-in-depth for the "Bandit on
+            // Takasten's Magneto row" symptom that prompted the 2026-04-26 fix.
+            bool conflictDbId = _selfDbId != 0
+                                && dbId != 0
+                                && dbId != _selfDbId;
+
+            if (conflictDbId)
+                return nickname;
+
             if (string.IsNullOrEmpty(nickname) && _selfDbId != 0
                 && _playerNameByDbId.TryGetValue(_selfDbId, out string? selfNameByDb)
                 && !string.IsNullOrEmpty(selfNameByDb))
