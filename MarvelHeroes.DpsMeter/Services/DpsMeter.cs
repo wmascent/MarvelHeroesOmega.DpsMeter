@@ -880,20 +880,38 @@ public sealed class DpsMeter : IDisposable
     /// the user reported on AIM Weapon Facility / MODOK (overlay stuck on
     /// "waiting for boss…" while the boss was clearly being killed on screen).</item>
     /// <item><b>Defer-and-promote</b> waits for evidence that the unknown is a real
-    /// long-lived target (5 hits or 200 k cumulative damage) before crediting any
-    /// damage.  Trash mobs die before crossing the threshold and never inflate;
-    /// real bosses cross it within the first ~0.5–1.0 s of combat and get all
-    /// their pre-threshold damage credited retroactively, so the user sees no
-    /// missing damage.</item>
-    /// </list></summary>
-    private const int UnknownBossAdmitHitThreshold = 5;
-
-    /// <summary>Cumulative-damage shortcut for the deferred-admit path — high-burst
-    /// heroes (Magneto, Iron Man) can land 200 k+ on a single hit, so a target
-    /// taking that much damage in fewer than <see cref="UnknownBossAdmitHitThreshold"/>
-    /// hits is also "boss-tier" and gets promoted early.  Trash mobs at L60 Cosmic
-    /// are capped at ~150 k HP so they die before reaching this threshold.</summary>
-    private const long UnknownBossAdmitDamageThreshold = 200_000;
+    /// long-lived target (cumulative damage ≥ <see cref="UnknownBossAdmitDamageThreshold"/>)
+    /// before crediting any damage.  Trash mobs and destructibles die before crossing
+    /// the threshold and never inflate; real bosses cross it within the first ~5 s of
+    /// combat and get all their pre-threshold damage credited retroactively, so the
+    /// user sees no missing damage.</item>
+    /// </list>
+    ///
+    /// <para><b>v1.0.3 take 1 (REJECTED):</b> initial threshold was 5 hits OR 200 k
+    /// damage.  Both turned out to be false-positive prone in live testing:</para>
+    /// <list type="bullet">
+    /// <item><b>5-hit threshold</b> — broken for fast-attacking / chain-attack heroes
+    /// (Blade Stake Storm, Iron Man Unibeam, Magneto Magnetic Fury, etc.).  These
+    /// powers land 5+ hits on a SINGLE target in &lt; 1 s, so even short-lived
+    /// destructibles get promoted before they die.  Symptom reported live by user
+    /// 2026-04-28 on Blade in a Maggia warehouse: <c>Fight: 2.07M</c> displayed
+    /// against a pile of broken crates with no boss visible.  Hit-count threshold
+    /// removed entirely as a result — it has no clean separation property.</item>
+    /// <item><b>200 k damage threshold</b> — well below the HP of common L60 cosmic
+    /// destructibles like vehicles (100–500 k HP), generators (100–300 k), reinforced
+    /// doors (50–200 k), fuel tanks, etc.  Even a single AOE hit from a high-burst
+    /// hero can land 200 k+ on a destructible (Iron Man Unibeam, Magneto Polarity
+    /// Shift), causing immediate false promotion.</item>
+    /// </list>
+    /// <para><b>v1.0.3 take 2 (CURRENT):</b> hit-count threshold deleted; damage
+    /// threshold raised to <see cref="UnknownBossAdmitDamageThreshold"/> = 1 M.  The
+    /// 1 M cutoff sits in a clean ~2× gap between the highest-HP destructible
+    /// (vehicles, generators, max ~500 k) and the lowest-HP "real boss" classification
+    /// (Hammerhead-tier daily bosses, ~5 M+).  Mini-bosses (200 k–1 M HP) are excluded
+    /// from boss-only mode by design — they belong to <c>BossPrototypes.MiniBossIndices</c>
+    /// — so a 1 M threshold matches the existing classification policy: only "real"
+    /// bosses (Boss + GroupBoss rank) get admitted.</para></summary>
+    private const long UnknownBossAdmitDamageThreshold = 1_000_000;
 
     /// <summary>TTL for entries in <see cref="_pendingUnknownBossTargets"/>.  Pending
     /// entries that haven't received a damage event in this long are evicted from the
@@ -907,26 +925,33 @@ public sealed class DpsMeter : IDisposable
     /// targets whose prototype is unknown (EntityCreate was missed or arrived after
     /// the first hit landed).  Entries are added by <see cref="OnDamageDealt"/>'s
     /// boss-mode filter, promoted to the encounter accumulator when a target crosses
-    /// <see cref="UnknownBossAdmitHitThreshold"/> hits OR
     /// <see cref="UnknownBossAdmitDamageThreshold"/> cumulative damage, removed when
-    /// the entity is killed/destroyed before promoting (trash), and TTL-evicted in
-    /// <see cref="Tick"/> if dormant for <see cref="PendingUnknownBossTtl"/>.
+    /// the entity is killed/destroyed before promoting (trash / destructibles), and
+    /// TTL-evicted in <see cref="Tick"/> if dormant for <see cref="PendingUnknownBossTtl"/>.
     ///
     /// <para>Per-owner damage is preserved in the bucket so promotion can retroactively
     /// credit the encounter accumulator with EVERY pre-promotion hit, not just future
     /// ones — this keeps the user's reported "Fight: " number accurate from the
     /// instant they engaged the boss, even though the meter only recognised it after
-    /// 5 hits.  Without per-owner buckets, a multi-player raid would lose attribution
-    /// for the first 5 hits across all players.</para>
+    /// the threshold was crossed.  Without per-owner buckets, a multi-player raid
+    /// would lose attribution for the first ~1 M of damage across all players.</para>
+    ///
+    /// <para>Hit-count was tracked alongside damage in v1.0.3 take 1 but was removed
+    /// after live testing showed it created false-promotion regressions for fast-
+    /// attacking heroes (see <see cref="UnknownBossAdmitDamageThreshold"/> doc).
+    /// <see cref="PendingUnknownBossTarget.HitCount"/> is still incremented for
+    /// diagnostic purposes (the deferral log line shows it so we can correlate with
+    /// power-attack patterns) but no longer participates in the promotion check.</para>
     ///
     /// <para>Lock <see cref="_sync"/>.</para></summary>
     private readonly Dictionary<ulong, PendingUnknownBossTarget> _pendingUnknownBossTargets = new();
 
     /// <summary>Per-entity bucket used by <see cref="_pendingUnknownBossTargets"/> — see
     /// that field's doc comment for the full rationale.  The structure is "deferred
-    /// engagement state": hit-count and cumulative damage drive the promotion check,
-    /// per-owner damage drives the retroactive encounter credit, first/last UTC drive
-    /// the TTL eviction.</summary>
+    /// engagement state": cumulative damage drives the promotion check; hit-count is
+    /// kept for diagnostics only (logged in the deferral line so we can correlate
+    /// with attack-rate); per-owner damage drives the retroactive encounter credit;
+    /// first/last UTC drive the TTL eviction.</summary>
     private sealed class PendingUnknownBossTarget
     {
         public int HitCount;
@@ -2034,16 +2059,17 @@ public sealed class DpsMeter : IDisposable
                 //     AIM Weapon Facility / MODOK: overlay stuck on "waiting for boss…" while
                 //     the boss was clearly being killed on screen.
                 //
-                // Current policy: <b>defer admit until evidence accumulates</b> (v1.0.3).
+                // Current policy: <b>defer admit until evidence accumulates</b> (v1.0.3 take 2).
                 // Track each unknown target in _pendingUnknownBossTargets; promote to admitted
-                // when the entity has been hit UnknownBossAdmitHitThreshold (5) times OR has
-                // accumulated UnknownBossAdmitDamageThreshold (200 k) cumulative damage —
-                // either threshold catches every real boss while rejecting every realistic
-                // trash mob (L60 Cosmic trash dies in 1–3 hits / 50–150 k HP).  When promoted,
-                // every pre-promotion hit's damage is RETROACTIVELY credited to the encounter
-                // accumulator so the user's "Fight: " number is accurate from the moment they
-                // first engaged the boss — even though the meter only recognised it ~0.5–1.0 s
-                // (or ~5 hits) later.
+                // when the entity has accumulated UnknownBossAdmitDamageThreshold (1 M)
+                // cumulative damage — well above any L60 destructible (max ~500 k HP for a
+                // generator / vehicle) and trash mob (50–150 k HP) but well under any "real"
+                // boss (5 M+ HP for the smallest daily boss).  Hit-count threshold deleted in
+                // take 2 — see UnknownBossAdmitDamageThreshold doc for the live-testing
+                // regression that motivated this.  When promoted, every pre-promotion hit's
+                // damage is RETROACTIVELY credited to the encounter accumulator so the user's
+                // "Fight: " number is accurate from the moment they first engaged the boss —
+                // even though the meter only recognised it after ~5 s of sustained pressure.
                 lock (_sync)
                 {
                     if (!_pendingUnknownBossTargets.TryGetValue(e.TargetEntityId, out var pending))
@@ -2063,14 +2089,12 @@ public sealed class DpsMeter : IDisposable
                     // pet-folded scoringOwner, so a peer-summon hit that promotes a boss
                     // credits the SUMMON's owner id from its pre-promotion buffer; this is a
                     // minor attribution edge case (pre-promotion damage under-credits the
-                    // chain-root by ≤ 5 hits) and is acceptable given that real bosses cross
-                    // the threshold within sub-second and the bulk of damage credit lands
-                    // AFTER promotion via the normal flow.
+                    // chain-root by a few hits) and is acceptable given that the bulk of
+                    // damage credit lands AFTER promotion via the normal flow.
                     pending.DamageByOwner.TryGetValue(rawOwner, out long ownerPrev);
                     pending.DamageByOwner[rawOwner] = ownerPrev + dmg;
 
-                    if (pending.HitCount >= UnknownBossAdmitHitThreshold
-                        || pending.TotalDamage >= UnknownBossAdmitDamageThreshold)
+                    if (pending.TotalDamage >= UnknownBossAdmitDamageThreshold)
                     {
                         // Promotion: capture bucket state for the scoring lock to credit, then
                         // remove from the pending dict so subsequent hits flow through the
@@ -2084,7 +2108,7 @@ public sealed class DpsMeter : IDisposable
                         _pendingUnknownBossTargets.Remove(e.TargetEntityId);
 
                         if (_loggedUnknownBossTargets.Add(e.TargetEntityId))
-                            Diagnostic?.Invoke($"DpsMeter: boss-filter admit (unknown prototype, deferred) — target entityId={e.TargetEntityId} promoted after {promotedHitCount} hits / {promotedTotalDamage:N0} dmg accumulated; retroactively crediting {promotedDamageByOwner.Count} owner(s) to encounter totals (real-boss pattern: hit count crossed threshold, trash mobs typically die before doing so)");
+                            Diagnostic?.Invoke($"DpsMeter: boss-filter admit (unknown prototype, deferred) — target entityId={e.TargetEntityId} promoted after {promotedHitCount} hits / {promotedTotalDamage:N0} dmg accumulated (>= {UnknownBossAdmitDamageThreshold:N0} threshold); retroactively crediting {promotedDamageByOwner.Count} owner(s) to encounter totals.  Real-boss pattern: cumulative damage crossed the threshold; destructibles (max ~500 k HP for vehicles/generators) and trash (50–150 k HP) die before reaching it.");
                         // Fall through to scoring — promotion data will be applied inside the lock below.
                     }
                     else
@@ -2094,7 +2118,7 @@ public sealed class DpsMeter : IDisposable
                         // and capped to avoid log flood when many trash mobs are hit briefly.
                         if (_loggedUnknownBossTargets.Count < UnknownTargetLogCap
                             && _loggedUnknownBossTargets.Add(e.TargetEntityId))
-                            Diagnostic?.Invoke($"DpsMeter: boss-filter defer (unknown prototype) — target entityId={e.TargetEntityId} hit {pending.HitCount}/{UnknownBossAdmitHitThreshold} times, dmg {pending.TotalDamage:N0}/{UnknownBossAdmitDamageThreshold:N0}; deferring admit until evidence accumulates (trash mobs typically die before crossing this threshold; if this is a real boss it'll be admitted within ~0.5–1.0 s of sustained combat and ALL pre-promotion damage will be retroactively credited so the Fight: number stays accurate)");
+                            Diagnostic?.Invoke($"DpsMeter: boss-filter defer (unknown prototype) — target entityId={e.TargetEntityId} hit {pending.HitCount} times, dmg {pending.TotalDamage:N0}/{UnknownBossAdmitDamageThreshold:N0}; deferring admit until cumulative damage crosses the threshold.  Trash and destructibles die before crossing; if this is a real boss it'll be admitted within ~3–8 s of sustained combat and ALL pre-promotion damage will be retroactively credited so the Fight: number stays accurate.");
                         return;
                     }
                 }
