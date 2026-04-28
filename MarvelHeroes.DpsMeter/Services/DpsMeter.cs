@@ -731,6 +731,11 @@ public sealed class DpsMeter : IDisposable
                 _engagedBossEntityIds.Clear();
                 _lastHitPerEngagedBoss.Clear();
                 _recentlyRemovedEntityIds.Clear();
+                // Pending-unknown-boss buckets are only consulted in _bossOnlyMode and
+                // are populated lazily on the first unknown-target hit; they're meaningless
+                // outside boss mode.  Wipe on every toggle so stale buffers from a previous
+                // boss-mode session can't surprise-promote on the first hit after re-enabling.
+                _pendingUnknownBossTargets.Clear();
                 _encounterStartUtc = DateTime.MinValue;
                 _encounterEndedUtc = DateTime.MinValue;
                 _lastEncounterDamageUtc = DateTime.MinValue;
@@ -855,6 +860,81 @@ public sealed class DpsMeter : IDisposable
     /// so dict size tracks the kill rate of the last ~2 s (typically &lt; 100 entries even
     /// in Holo-Sim crowds).  Lock <see cref="_sync"/>.</para></summary>
     private readonly Dictionary<ulong, DateTime> _recentlyRemovedEntityIds = new();
+
+    /// <summary>Hits per unknown-prototype target needed before the boss-mode filter
+    /// promotes the entity from "deferred" to "admitted" and credits its accumulated
+    /// damage to the encounter accumulator.  Trash mobs in MH endgame content
+    /// (L60 Cosmic) typically have 50 k–150 k HP and die in 1–3 hits even from
+    /// non-burst heroes; bosses have 5 M–50 M HP and survive 50+ hits, so 5 hits
+    /// is a clean structural discriminator that catches every realistic boss while
+    /// rejecting every realistic trash-mob false-admit.
+    ///
+    /// <para>Why a defer-and-promote scheme instead of just admit-or-drop:</para>
+    /// <list type="bullet">
+    /// <item><b>Admit-on-unknown</b> (the original policy) catches every boss whose
+    /// EntityCreate was missed (mid-region attach, sniffer restart) but at the cost
+    /// of admitting every trash mob in the same situation.  Live observation in
+    /// Maggia terminals showed <c>engagedBosses=22</c> and inflated totals.</item>
+    /// <item><b>Drop-on-unknown</b> (the v1.0.2 fix) eliminates the inflation but
+    /// silently drops a real boss whose EntityCreate was lost — exactly the case
+    /// the user reported on AIM Weapon Facility / MODOK (overlay stuck on
+    /// "waiting for boss…" while the boss was clearly being killed on screen).</item>
+    /// <item><b>Defer-and-promote</b> waits for evidence that the unknown is a real
+    /// long-lived target (5 hits or 200 k cumulative damage) before crediting any
+    /// damage.  Trash mobs die before crossing the threshold and never inflate;
+    /// real bosses cross it within the first ~0.5–1.0 s of combat and get all
+    /// their pre-threshold damage credited retroactively, so the user sees no
+    /// missing damage.</item>
+    /// </list></summary>
+    private const int UnknownBossAdmitHitThreshold = 5;
+
+    /// <summary>Cumulative-damage shortcut for the deferred-admit path — high-burst
+    /// heroes (Magneto, Iron Man) can land 200 k+ on a single hit, so a target
+    /// taking that much damage in fewer than <see cref="UnknownBossAdmitHitThreshold"/>
+    /// hits is also "boss-tier" and gets promoted early.  Trash mobs at L60 Cosmic
+    /// are capped at ~150 k HP so they die before reaching this threshold.</summary>
+    private const long UnknownBossAdmitDamageThreshold = 200_000;
+
+    /// <summary>TTL for entries in <see cref="_pendingUnknownBossTargets"/>.  Pending
+    /// entries that haven't received a damage event in this long are evicted from the
+    /// dict during <see cref="Tick"/> — bounds memory growth in long sessions where
+    /// the user wandered into many AOIs without engaging anything (every 1-hit
+    /// glance damage on a passing patrol mob would otherwise leave a permanent entry
+    /// in the deferred queue).</summary>
+    private static readonly TimeSpan PendingUnknownBossTtl = TimeSpan.FromSeconds(60);
+
+    /// <summary>Tracks per-entity hit count + per-owner accumulated damage for boss-mode
+    /// targets whose prototype is unknown (EntityCreate was missed or arrived after
+    /// the first hit landed).  Entries are added by <see cref="OnDamageDealt"/>'s
+    /// boss-mode filter, promoted to the encounter accumulator when a target crosses
+    /// <see cref="UnknownBossAdmitHitThreshold"/> hits OR
+    /// <see cref="UnknownBossAdmitDamageThreshold"/> cumulative damage, removed when
+    /// the entity is killed/destroyed before promoting (trash), and TTL-evicted in
+    /// <see cref="Tick"/> if dormant for <see cref="PendingUnknownBossTtl"/>.
+    ///
+    /// <para>Per-owner damage is preserved in the bucket so promotion can retroactively
+    /// credit the encounter accumulator with EVERY pre-promotion hit, not just future
+    /// ones — this keeps the user's reported "Fight: " number accurate from the
+    /// instant they engaged the boss, even though the meter only recognised it after
+    /// 5 hits.  Without per-owner buckets, a multi-player raid would lose attribution
+    /// for the first 5 hits across all players.</para>
+    ///
+    /// <para>Lock <see cref="_sync"/>.</para></summary>
+    private readonly Dictionary<ulong, PendingUnknownBossTarget> _pendingUnknownBossTargets = new();
+
+    /// <summary>Per-entity bucket used by <see cref="_pendingUnknownBossTargets"/> — see
+    /// that field's doc comment for the full rationale.  The structure is "deferred
+    /// engagement state": hit-count and cumulative damage drive the promotion check,
+    /// per-owner damage drives the retroactive encounter credit, first/last UTC drive
+    /// the TTL eviction.</summary>
+    private sealed class PendingUnknownBossTarget
+    {
+        public int HitCount;
+        public long TotalDamage;
+        public DateTime FirstHitUtc;
+        public DateTime LastHitUtc;
+        public Dictionary<ulong, long> DamageByOwner = new();
+    }
 
     /// <summary>UTC time of the last damage event (any owner — self OR peer) that flowed into
     /// <see cref="_encounterTotalsPerOwner"/>.  Updated on every accumulator add in
@@ -1913,28 +1993,111 @@ public sealed class DpsMeter : IDisposable
         // ── Boss-only filter (runs BEFORE the lock so we don't churn window state for hits we
         // immediately throw away).  We resolve target → prototypeEnumIndex via the same cache the
         // main resolver uses; if the target's EntityCreate was missed, its prototype is unknown
-        // and we conservatively drop the hit rather than admit a possibly-trash mob.
+        // and the deferred-admit logic below decides whether to count the hit by waiting for
+        // hit-count / cumulative-damage evidence (real bosses survive the threshold; trash mobs
+        // die before crossing it).
         //
         // The rejection paths ALSO emit a one-shot diagnostic per unique target so "I'm hitting a
         // named mob but the meter stays at 0" is trivially debuggable: the user pastes the log,
         // we see the exact protoIdx, and we can either widen the filter (e.g. add Elite) or
         // retroactively mark a specific mob as boss if the game-data classification disagrees with
         // player intuition (named mobs with yellow `!` aren't always rank==Boss on the server).
+
+        // Promotion-result locals: populated when the boss-mode unknown branch resolves a
+        // deferred bucket to "admitted" (5 hits or 200 k cumulative damage threshold met),
+        // consumed inside the scoring lock below to retroactively credit pre-promotion
+        // hits to the encounter accumulator.  See _pendingUnknownBossTargets field doc
+        // for the full rationale and trade-off analysis.
+        bool unknownPromotedThisHit = false;
+        Dictionary<ulong, long>? promotedDamageByOwner = null;
+        DateTime promotedFirstHitUtc = default;
+        int promotedHitCount = 0;
+        long promotedTotalDamage = 0;
+
         if (_bossOnlyMode)
         {
             if (e.TargetEntityId == 0) return;
             if (!_prototypeByEntityId.TryGetValue(e.TargetEntityId, out uint targetProtoIdx))
             {
                 // Unknown prototype (we missed this target's EntityCreate — usually because the
-                // app attached mid-fight or we lost a packet). Empirically this is the most
-                // common reason a real boss fails the strict classification: the boss spawned
-                // during patrol events BEFORE we got its protoIdx cached. Admit optimistically —
-                // the worst case is a few seconds of inflated numbers during region ramp-up,
-                // which is still closer to user intent ("I'm hitting this important thing") than
-                // dropping a whole boss encounter silently.
-                if (_loggedUnknownBossTargets.Add(e.TargetEntityId))
-                    Diagnostic?.Invoke($"DpsMeter: boss-filter admit (unknown prototype) — target entityId={e.TargetEntityId} (EntityCreate missed; counting optimistically)");
-                // fall through to the normal scoring path
+                // app attached mid-region, or the user issued "Restart sniffer" without zoning
+                // afterwards, so all entities already in AOI never had their EntityCreate
+                // re-emitted).
+                //
+                // Two earlier policies failed under live testing:
+                //   • Admit optimistically (original): caught every real boss but inflated
+                //     totals with trash whose EntityCreate was also missed.  Live observation
+                //     in Maggia terminal: engagedBosses=22 fightSelf=4.9M (every Hammerhead
+                //     treated as a boss).
+                //   • Drop conservatively (v1.0.2 fix): eliminated the inflation but silently
+                //     dropped real bosses whose EntityCreate was lost.  Live observation on
+                //     AIM Weapon Facility / MODOK: overlay stuck on "waiting for boss…" while
+                //     the boss was clearly being killed on screen.
+                //
+                // Current policy: <b>defer admit until evidence accumulates</b> (v1.0.3).
+                // Track each unknown target in _pendingUnknownBossTargets; promote to admitted
+                // when the entity has been hit UnknownBossAdmitHitThreshold (5) times OR has
+                // accumulated UnknownBossAdmitDamageThreshold (200 k) cumulative damage —
+                // either threshold catches every real boss while rejecting every realistic
+                // trash mob (L60 Cosmic trash dies in 1–3 hits / 50–150 k HP).  When promoted,
+                // every pre-promotion hit's damage is RETROACTIVELY credited to the encounter
+                // accumulator so the user's "Fight: " number is accurate from the moment they
+                // first engaged the boss — even though the meter only recognised it ~0.5–1.0 s
+                // (or ~5 hits) later.
+                lock (_sync)
+                {
+                    if (!_pendingUnknownBossTargets.TryGetValue(e.TargetEntityId, out var pending))
+                    {
+                        pending = new PendingUnknownBossTarget { FirstHitUtc = e.UtcTime };
+                        _pendingUnknownBossTargets[e.TargetEntityId] = pending;
+                    }
+                    pending.HitCount++;
+                    pending.TotalDamage += dmg;
+                    pending.LastHitUtc = e.UtcTime;
+
+                    // Per-owner attribution uses `rawOwner` (the same wire-level fallback
+                    // chain — UltimateOwnerEntityId, falling back to PowerOwnerEntityId — that
+                    // the main scoring path uses BEFORE pet-fold).  The promotion path will
+                    // credit this aggregate to _encounterTotalsPerOwner.  The CURRENT hit is
+                    // then added separately via the normal scoring path below using the
+                    // pet-folded scoringOwner, so a peer-summon hit that promotes a boss
+                    // credits the SUMMON's owner id from its pre-promotion buffer; this is a
+                    // minor attribution edge case (pre-promotion damage under-credits the
+                    // chain-root by ≤ 5 hits) and is acceptable given that real bosses cross
+                    // the threshold within sub-second and the bulk of damage credit lands
+                    // AFTER promotion via the normal flow.
+                    pending.DamageByOwner.TryGetValue(rawOwner, out long ownerPrev);
+                    pending.DamageByOwner[rawOwner] = ownerPrev + dmg;
+
+                    if (pending.HitCount >= UnknownBossAdmitHitThreshold
+                        || pending.TotalDamage >= UnknownBossAdmitDamageThreshold)
+                    {
+                        // Promotion: capture bucket state for the scoring lock to credit, then
+                        // remove from the pending dict so subsequent hits flow through the
+                        // normal path (the entity is now in _engagedBossEntityIds via the
+                        // standard accumulator add further down).
+                        unknownPromotedThisHit = true;
+                        promotedDamageByOwner = pending.DamageByOwner;
+                        promotedFirstHitUtc = pending.FirstHitUtc;
+                        promotedHitCount = pending.HitCount;
+                        promotedTotalDamage = pending.TotalDamage;
+                        _pendingUnknownBossTargets.Remove(e.TargetEntityId);
+
+                        if (_loggedUnknownBossTargets.Add(e.TargetEntityId))
+                            Diagnostic?.Invoke($"DpsMeter: boss-filter admit (unknown prototype, deferred) — target entityId={e.TargetEntityId} promoted after {promotedHitCount} hits / {promotedTotalDamage:N0} dmg accumulated; retroactively crediting {promotedDamageByOwner.Count} owner(s) to encounter totals (real-boss pattern: hit count crossed threshold, trash mobs typically die before doing so)");
+                        // Fall through to scoring — promotion data will be applied inside the lock below.
+                    }
+                    else
+                    {
+                        // Defer: this hit is dropped (it'll be retroactively credited when /
+                        // if the entity crosses the threshold).  Diagnostic dedup is per-entity
+                        // and capped to avoid log flood when many trash mobs are hit briefly.
+                        if (_loggedUnknownBossTargets.Count < UnknownTargetLogCap
+                            && _loggedUnknownBossTargets.Add(e.TargetEntityId))
+                            Diagnostic?.Invoke($"DpsMeter: boss-filter defer (unknown prototype) — target entityId={e.TargetEntityId} hit {pending.HitCount}/{UnknownBossAdmitHitThreshold} times, dmg {pending.TotalDamage:N0}/{UnknownBossAdmitDamageThreshold:N0}; deferring admit until evidence accumulates (trash mobs typically die before crossing this threshold; if this is a real boss it'll be admitted within ~0.5–1.0 s of sustained combat and ALL pre-promotion damage will be retroactively credited so the Fight: number stays accurate)");
+                        return;
+                    }
+                }
             }
             else if (BossPrototypes.TryClassifyBoss(targetProtoIdx, out bool admittedViaShift))
             {
@@ -2431,8 +2594,21 @@ public sealed class DpsMeter : IDisposable
                 {
                     if (_encounterStartUtc == DateTime.MinValue)
                     {
-                        _encounterStartUtc = now;
+                        // If this hit is the one promoting a deferred-unknown bucket, anchor
+                        // the encounter start to the bucket's FIRST recorded hit (typically
+                        // 0.3–1.0 s earlier) so the duration / Fight: number reflect the user's
+                        // actual time-on-target rather than the moment the meter recognised it.
+                        _encounterStartUtc = unknownPromotedThisHit ? promotedFirstHitUtc : now;
                         Diagnostic?.Invoke($"DpsMeter: encounter started (firstTarget={e.TargetEntityId}, firstOwner={scoringOwner})");
+                    }
+                    else if (unknownPromotedThisHit && _encounterStartUtc > promotedFirstHitUtc)
+                    {
+                        // A separate boss already opened the encounter, but this newly-promoted
+                        // entity's first deferred hit predates the existing start time — pull the
+                        // start back so duration covers the whole engagement.  (Rare; happens when
+                        // two unknown-prototype bosses are simultaneously buffered and the second
+                        // crosses the threshold while the first is still pending.)
+                        _encounterStartUtc = promotedFirstHitUtc;
                     }
 
                     if (e.TargetEntityId != 0)
@@ -2442,6 +2618,29 @@ public sealed class DpsMeter : IDisposable
                         // in Tick — without this, missed kill events would let a long-dead boss
                         // sit in the engaged set indefinitely and prevent the next-fight clear.
                         _lastHitPerEngagedBoss[e.TargetEntityId] = now;
+                    }
+
+                    // Retroactive credit for the deferred-bucket promotion path.  Each pre-
+                    // promotion hit's damage is added to the encounter totals BEFORE the current
+                    // hit is scored, so the post-promotion `Fight: ` number reflects the user's
+                    // full damage on this target — not just the slice that landed after the
+                    // 5-hit / 200 k threshold tripped.
+                    //
+                    // Owner attribution uses the WIRE OWNER (e.OwnerEntityId) recorded into the
+                    // bucket on each pre-promotion hit; pet-fold is NOT applied here because the
+                    // _petRootOwnerByEntity map may not have learned the chain root yet at the
+                    // time those hits were buffered.  In practice the bucket only ever holds 1–5
+                    // pre-promotion hits before a real boss promotes, so the worst-case mis-
+                    // attribution is a brief 1-row inflation on a peer summon's entity id which
+                    // the render-time CoalesceRowsByPetChainRoot pass will collapse on the next
+                    // refresh once the chain edge is observed.
+                    if (unknownPromotedThisHit && promotedDamageByOwner != null)
+                    {
+                        foreach (var kv in promotedDamageByOwner)
+                        {
+                            _encounterTotalsPerOwner.TryGetValue(kv.Key, out long retroPrev);
+                            _encounterTotalsPerOwner[kv.Key] = retroPrev + kv.Value;
+                        }
                     }
 
                     _encounterTotalsPerOwner.TryGetValue(scoringOwner, out long encPrev);
@@ -2689,6 +2888,30 @@ public sealed class DpsMeter : IDisposable
 
         lock (_sync)
         {
+            // ── Pending-unknown-boss bucket TTL prune ───────────────────────────────────────
+            // Buckets older than PendingUnknownBossTtl (60 s) without crossing the admit
+            // threshold are stale — the entity either died (kill packet missed → bucket
+            // never got the OnEngagedEntityRemoved cleanup) or wandered out of the user's
+            // engagement (stopped hitting it; the few buffered hits will never accumulate
+            // more evidence).  Either way, the bucket can't promote any more and just
+            // wastes memory / could mis-promote on a rare future colliding hit.  Drop
+            // unconditionally; the next genuine engagement will rebuild from scratch.
+            if (_pendingUnknownBossTargets.Count > 0)
+            {
+                DateTime pendingCutoff = nowUtc - PendingUnknownBossTtl;
+                List<ulong>? toDropPending = null;
+                foreach (var kv in _pendingUnknownBossTargets)
+                {
+                    if (kv.Value.LastHitUtc < pendingCutoff)
+                        (toDropPending ??= new List<ulong>()).Add(kv.Key);
+                }
+                if (toDropPending != null)
+                {
+                    foreach (ulong id in toDropPending)
+                        _pendingUnknownBossTargets.Remove(id);
+                }
+            }
+
             // ── Engaged-boss idle eviction ──────────────────────────────────────────────────
             // Sweep _lastHitPerEngagedBoss; evict any boss that hasn't been hit in
             // EngagedBossIdleEviction (15 s).  Bosses presumed dead via missed kill / destroy
@@ -3220,6 +3443,13 @@ public sealed class DpsMeter : IDisposable
             _engagedBossEntityIds.Clear();
             _lastHitPerEngagedBoss.Clear();
             _recentlyRemovedEntityIds.Clear();
+            // Pending-unknown-boss buckets are per-entity-id and entity ids are per-region;
+            // any surviving bucket would either point at a stale entity id (server stops
+            // streaming the abandoned entity) or, worse, get its admit threshold tripped by
+            // a colliding new entity id in the next region.  Wipe unconditionally on every
+            // reset path — the deferred-admit logic is fundamentally a per-region rolling
+            // evidence accumulator.
+            _pendingUnknownBossTargets.Clear();
             _encounterStartUtc = DateTime.MinValue;
             _encounterEndedUtc = DateTime.MinValue;
             _lastEncounterDamageUtc = DateTime.MinValue;
@@ -3366,6 +3596,19 @@ public sealed class DpsMeter : IDisposable
 
         lock (_sync)
         {
+            // Drop any pending-unknown-boss bucket for this entityId BEFORE the engaged-set
+            // miss check.  An entity that dies while still in _pendingUnknownBossTargets is by
+            // definition a trash mob (it died before crossing the 5-hit / 200 k threshold), so
+            // its accumulated buffer is discarded and never gets promoted — exactly the behaviour
+            // we want.  We do this unconditionally because pending entities are NOT in
+            // _engagedBossEntityIds yet, so the early return below would skip them otherwise.
+            if (_pendingUnknownBossTargets.Remove(entityId, out var droppedPending)
+                && _loggedUnknownBossTargets.Count < UnknownTargetLogCap
+                && _loggedUnknownBossTargets.Add(entityId))
+            {
+                Diagnostic?.Invoke($"DpsMeter: boss-filter discard (pending unknown {sourceTag} before promotion) — target entityId={entityId} died after {droppedPending.HitCount} hits / {droppedPending.TotalDamage:N0} dmg without crossing the admit threshold; bucket discarded (this is the expected outcome for trash mobs whose EntityCreate was missed — real bosses survive long enough to be admitted).");
+            }
+
             // Cheap miss check first — vast majority of removals are non-boss entities and
             // the HashSet.Remove already does a bucket lookup, so duplicating with Contains
             // would cost more than it saves.
