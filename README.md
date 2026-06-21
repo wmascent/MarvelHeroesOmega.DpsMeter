@@ -1,3 +1,5 @@
+# OBSOLETE. USE https://github.com/wmascent/MarvelHeroesOmega.Overlay.releases
+
 # Marvel Heroes — Standalone DPS Meter
 
 Always-on-top WPF overlay that displays real-time DPS for Marvel Heroes
